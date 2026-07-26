@@ -124,3 +124,37 @@ async def test_expired_stored_session_triggers_a_rescan(monkeypatch):
     connection, notes = await auth.connect()
     assert connection.credentials.cookies["canvas_session"] == "fresh"
     assert any("expired" in note for note in notes)
+
+
+async def test_import_cookies_saves_the_session_it_reports_saving(monkeypatch):
+    """`import-cookies` printed "Saved to ..." while persisting nothing.
+
+    It is the first connect route the README recommends, so the effect was that
+    every later command - and the server itself - still saw no session.
+    """
+    from types import SimpleNamespace
+
+    from canvas_mcp import cli
+    from canvas_mcp.client import Credentials
+
+    connection = auth.Connection(
+        credentials=Credentials(
+            base_url=HOST, cookies={"canvas_session": "abc"}, source="browser:chrome"
+        ),
+        profile=PROFILE,
+    )
+
+    async def fake_browser_import(base_url_hint=""):
+        return connection, []
+
+    monkeypatch.setattr(auth, "try_browser_import", fake_browser_import)
+    assert config.load_session() is None
+
+    assert await cli.cmd_import(SimpleNamespace(base_url="")) == 0
+
+    stored = config.load_session()
+    assert stored is not None
+    assert stored.base_url == HOST
+    assert stored.cookies == {"canvas_session": "abc"}
+    assert stored.source == "browser:chrome"
+    assert stored.user.get("short_name") == "Sam"

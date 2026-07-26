@@ -127,6 +127,7 @@ async def cmd_import(args: Any) -> int:
         print("\nNo usable Canvas session found.")
         print(CONNECT_HINT)
         return 1
+    auth.save_connection(connection)
     print(
         f"\nConnected to {connection.credentials.base_url} as {connection.display_name}"
         f" (from {connection.credentials.source})."

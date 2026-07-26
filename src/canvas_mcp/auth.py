@@ -164,7 +164,7 @@ async def connect(
         profile = await validate(creds)
         connection = Connection(creds, profile)
         if persist:
-            _persist(connection)
+            save_connection(connection)
         return connection, notes
 
     env_creds = credentials_from_env()
@@ -185,7 +185,7 @@ async def connect(
         notes.extend(scan_notes)
         if connection:
             if persist:
-                _persist(connection)
+                save_connection(connection)
             return connection, notes
 
     raise AuthError(_failure_message(notes), hint=CONNECT_HINT)
@@ -214,7 +214,8 @@ def _stored_base_url() -> str:
     return stored.base_url if stored else ""
 
 
-def _persist(connection: Connection) -> None:
+def save_connection(connection: Connection) -> None:
+    """Save a validated connection so later runs don't have to rediscover it."""
     stored = connection.credentials.to_stored(user=_slim_profile(connection.profile))
     stored.saved_at = time.time()
     config.save_session(stored)
