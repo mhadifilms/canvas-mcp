@@ -36,10 +36,17 @@ Once it's connected, these are ordinary questions:
 
 ## Install
 
+Requires Python ≥ 3.10. Nothing to clone — install straight from GitHub:
+
 ```bash
-git clone <this repo>
-cd canvas-mcp
-pip install -e ".[all]"
+pip install "canvas-mcp[all] @ git+https://github.com/mhadifilms/canvas-mcp"
+```
+
+Or with [uv](https://docs.astral.sh/uv/), which keeps it in its own environment:
+
+```bash
+uv tool install --with browser-cookie3 --with pypdf --with python-docx --with python-pptx \
+  "git+https://github.com/mhadifilms/canvas-mcp"
 ```
 
 The extras matter:
@@ -321,6 +328,8 @@ from. Log back in to Canvas and run `canvas-mcp import-cookies` again.
 ## Development
 
 ```bash
+git clone https://github.com/mhadifilms/canvas-mcp
+cd canvas-mcp
 pip install -e ".[dev]"
 pytest
 ```

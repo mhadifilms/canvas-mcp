@@ -9,12 +9,25 @@ description = "MCP server for Canvas LMS that works without an API key, by reusi
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["mcp", "canvas", "lms", "instructure", "students"]
+authors = [{ name = "M Hadi" }]
+keywords = ["mcp", "canvas", "lms", "instructure", "students", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Education",
+]
 
 dependencies = [
     "mcp>=1.9.0",
     "httpx>=0.27",
 ]
+
+[project.urls]
+Repository = "https://github.com/mhadifilms/canvas-mcp"
+Issues = "https://github.com/mhadifilms/canvas-mcp/issues"
 
 [project.optional-dependencies]
 # Pull the Canvas session straight out of an already-logged-in browser.
