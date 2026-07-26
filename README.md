@@ -200,7 +200,7 @@ These use the course's real assignment group weights and grading scheme. That ma
 | `discussions` | List discussion topics, or read one with its replies |
 | `list_quizzes` | Quizzes and exams with time limits and attempt counts |
 
-**Your planner** (skipped entirely if `CANVAS_MCP_READ_ONLY=1`)
+**Your planner** (these three refuse to run if `CANVAS_MCP_READ_ONLY=1`)
 
 | Tool | What it does |
 |---|---|
