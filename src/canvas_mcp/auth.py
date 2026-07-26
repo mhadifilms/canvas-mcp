@@ -191,6 +191,24 @@ async def connect(
     raise AuthError(_failure_message(notes), hint=CONNECT_HINT)
 
 
+def refresh_stored_cookies(base_url: str, cookies: dict[str, str]) -> bool:
+    """Write a rotated cookie jar back to the saved session.
+
+    Canvas hands out a new session cookie as you use it. Persisting the current jar
+    means the saved session ages from the last request rather than the first, which
+    is most of what stops a student having to reconnect every morning.
+    """
+    stored = config.load_session()
+    if stored is None or stored.base_url != base_url or not cookies:
+        return False
+    if stored.cookies == cookies:
+        return False
+    stored.cookies = dict(cookies)
+    stored.saved_at = time.time()
+    config.save_session(stored)
+    return True
+
+
 def _stored_base_url() -> str:
     stored = config.load_session()
     return stored.base_url if stored else ""

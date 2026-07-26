@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,8 +34,15 @@ SESSION_COOKIE_NAMES = (
     "_normandy_session",
     "_legacy_normandy_session",
 )
+# "Stay signed in" cookies. These outlive the session by weeks, and Canvas will
+# mint a fresh session from one - which is the difference between reconnecting
+# once a month and reconnecting every morning.
+REMEMBER_COOKIE_NAMES = (
+    "pseudonym_credentials",
+    "canvas_pseudonym",
+)
 # Cookies worth replaying alongside the session (CSRF token, sticky routing, etc.).
-USEFUL_COOKIE_NAMES = SESSION_COOKIE_NAMES + (
+USEFUL_COOKIE_NAMES = SESSION_COOKIE_NAMES + REMEMBER_COOKIE_NAMES + (
     "_csrf_token",
     "log_session_id",
     "canvas_theme_preference",
@@ -57,9 +65,20 @@ class BrowserSession:
     def has_session(self) -> bool:
         return any(name in self.cookies for name in SESSION_COOKIE_NAMES)
 
+    def has_remember_me(self) -> bool:
+        """A "stay signed in" cookie means this login survives session expiry."""
+        return any(is_remember_me(name) for name in self.cookies)
+
     def describe(self) -> str:
         where = f"{self.browser}" + (f" ({self.profile})" if self.profile else "")
         return f"{self.host} via {where}"
+
+
+def is_remember_me(name: str) -> bool:
+    """Canvas suffixes the remember-me cookie per account on some deployments."""
+    return name in REMEMBER_COOKIE_NAMES or name.startswith(
+        ("pseudonym_credentials", "canvas_pseudonym")
+    )
 
 
 def looks_like_canvas(host: str, cookie_names: set[str]) -> bool:
@@ -117,7 +136,8 @@ def _firefox_cookie_dbs() -> list[tuple[str, Path]]:
     return found
 
 
-def _read_sqlite_copy(db: Path, query: str, params: tuple = ()) -> list[tuple]:
+@contextmanager
+def _opened_copy(db: Path):
     """Copy the DB aside first - a running browser holds a lock on the original."""
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / db.name
@@ -128,22 +148,42 @@ def _read_sqlite_copy(db: Path, query: str, params: tuple = ()) -> list[tuple]:
                 shutil.copy2(side, target.with_name(target.name + suffix))
         conn = sqlite3.connect(f"file:{target}?immutable=0", uri=True)
         try:
-            return list(conn.execute(query, params))
+            yield conn
         finally:
             conn.close()
 
 
+# Hosts are identified first, then read in full. Finding the host by cookie name
+# alone would drop everything else that host set - including the remember-me
+# cookie, which is the one that keeps a login alive for weeks.
+_CANDIDATE_HOSTS_SQL = (
+    "SELECT DISTINCT host FROM moz_cookies "
+    "WHERE host LIKE '%instructure.com' OR host LIKE '%canvas%' OR name IN (?, ?, ?)"
+)
+
+
 def firefox_sessions(host_filter: str | None = None) -> list[BrowserSession]:
     sessions: list[BrowserSession] = []
-    query = (
-        "SELECT host, name, value FROM moz_cookies "
-        "WHERE host LIKE '%instructure.com' OR host LIKE '%canvas%' OR name IN (?, ?, ?)"
-    )
     for label, db in _firefox_cookie_dbs():
         try:
-            rows = _read_sqlite_copy(db, query, SESSION_COOKIE_NAMES)
+            with _opened_copy(db) as conn:
+                hosts = [
+                    str(row[0]) for row in conn.execute(_CANDIDATE_HOSTS_SQL, SESSION_COOKIE_NAMES)
+                ]
+                if host_filter:
+                    hosts = [h for h in hosts if host_matches(h, host_filter)]
+                if not hosts:
+                    continue
+                placeholders = ",".join("?" * len(hosts))
+                rows = list(
+                    conn.execute(
+                        f"SELECT host, name, value FROM moz_cookies WHERE host IN ({placeholders})",
+                        hosts,
+                    )
+                )
         except (sqlite3.Error, OSError):
             continue
+
         by_host: dict[str, dict[str, str]] = {}
         for host, name, value in rows:
             by_host.setdefault(str(host).lstrip("."), {})[str(name)] = str(value)
@@ -200,14 +240,14 @@ def bc3_sessions(host_filter: str | None = None) -> tuple[list[BrowserSession], 
                 notes.append(f"{name}: {message}")
             continue
 
+        # Same two-pass shape as the Firefox reader: work out which hosts are
+        # Canvas, then keep everything those hosts set and nothing from anywhere else.
         by_host: dict[str, dict[str, str]] = {}
         for cookie in jar:
             host = (cookie.domain or "").lstrip(".")
             if not host:
                 continue
             if host_filter and not host_matches(host, host_filter):
-                continue
-            if "instructure.com" not in host and "canvas" not in host and cookie.name not in USEFUL_COOKIE_NAMES:
                 continue
             by_host.setdefault(host, {})[cookie.name] = cookie.value or ""
 
@@ -248,5 +288,10 @@ def discover_sessions(host_filter: str | None = None) -> tuple[list[BrowserSessi
         if current is None or len(session.cookies) > len(current.cookies):
             best[key] = session
 
-    ordered = sorted(best.values(), key=lambda s: (not s.has_session(), s.host, s.browser))
+    # A login that carries a remember-me cookie is worth more than one that doesn't:
+    # it survives session expiry, so it is what we want saved.
+    ordered = sorted(
+        best.values(),
+        key=lambda s: (not s.has_session(), not s.has_remember_me(), s.host, s.browser),
+    )
     return ordered, notes

@@ -40,6 +40,11 @@ ACCEPT = "application/json+canvas-string-ids, application/json"
 LOGIN_PATH_RE = re.compile(r"/login(/|$)|/saml|/sso|/oauth2/auth", re.IGNORECASE)
 
 
+async def _backoff(seconds: float) -> None:
+    """Retry delay, behind a named function so tests can skip the waiting."""
+    await asyncio.sleep(seconds)
+
+
 @dataclass
 class Credentials:
     base_url: str
@@ -100,6 +105,15 @@ class CanvasClient:
 
     # -- lifecycle ---------------------------------------------------------- #
 
+    def current_cookies(self) -> dict[str, str]:
+        """The jar as it stands now.
+
+        Canvas rotates the session cookie as you use it, so what we started with is
+        not necessarily what is valid five minutes later. Saving the live jar back to
+        disk is what lets a session outlive the process that refreshed it.
+        """
+        return {name: value for name, value in self._http.cookies.items()}
+
     async def aclose(self) -> None:
         await self._http.aclose()
 
@@ -140,7 +154,7 @@ class CanvasClient:
                         f"Could not reach {self.base_url}: {exc}. Check your internet connection "
                         "(and that you are on the campus VPN if your school requires one)."
                     ) from exc
-                await asyncio.sleep(2**attempt)
+                await _backoff(2**attempt)
                 continue
 
             if response.status_code == 403 and self._is_rate_limited(response):
@@ -148,11 +162,11 @@ class CanvasClient:
                     raise RateLimitError(
                         "Canvas is rate limiting this account. Wait a minute and try again."
                     )
-                await asyncio.sleep(2 ** (attempt + 1))
+                await _backoff(2 ** (attempt + 1))
                 continue
 
             if response.status_code in (502, 503, 504) and attempt < attempts - 1:
-                await asyncio.sleep(2**attempt)
+                await _backoff(2**attempt)
                 continue
 
             self._raise_for_status(response, path)

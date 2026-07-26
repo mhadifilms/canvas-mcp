@@ -10,13 +10,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 @pytest.fixture(autouse=True)
 def no_backoff_sleeps(monkeypatch):
-    """Retry backoff is real in production and pointless in tests."""
+    """Retry backoff is real in production and pointless in tests.
+
+    Patches the client's own backoff hook rather than asyncio.sleep, so tests that
+    genuinely need to wait for a background task still can.
+    """
     import canvas_mcp.client as client_module
 
     async def instant(_seconds):
         return None
 
-    monkeypatch.setattr(client_module.asyncio, "sleep", instant)
+    monkeypatch.setattr(client_module, "_backoff", instant)
 
 
 @pytest.fixture(autouse=True)

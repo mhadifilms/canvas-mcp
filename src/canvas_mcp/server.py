@@ -26,7 +26,7 @@ from urllib.parse import urljoin
 
 from mcp.server.fastmcp import FastMCP
 
-from . import auth, config
+from . import auth, config, digest, documents, gradecalc, ics, queries
 from .client import CanvasClient, chunked
 from .errors import AuthError, CanvasMCPError
 from .formatting import (
@@ -52,6 +52,15 @@ they cover every course in one call. Reach for the per-course tools
 (`list_assignments`, `get_assignment`, `course_modules`, `grades`) once you know
 which class matters.
 
+For anything about grades, prefer `grade_forecast`, `what_if` and `triage` over
+doing the arithmetic yourself - they use the course's real assignment group
+weights, which is the part that is easy to get wrong. `triage` is the right tool
+when a student has fallen behind and needs to know what to do first.
+
+`read_file` extracts the text of slides and readings, so course material can be
+discussed rather than just listed. `export_calendar` puts deadlines on the
+student's phone calendar.
+
 Course arguments are forgiving: an id, a course code, or part of the name all work.
 
 This server reads coursework and manages the student's own planner. It cannot
@@ -71,11 +80,65 @@ class _State:
     profile: dict[str, Any] = {}
     source: str = ""
     revalidate_after: float = 0.0
+    keepalive: "asyncio.Task[None] | None" = None
 
 
 _state = _State()
 _lock = asyncio.Lock()
 REVALIDATE_SECONDS = 900
+
+
+def _keepalive_interval() -> int:
+    """Seconds between keepalive pings; 0 disables it."""
+    try:
+        return max(0, int(os.environ.get("CANVAS_MCP_KEEPALIVE_SECONDS", "600")))
+    except ValueError:
+        return 600
+
+
+async def _keepalive_tick() -> None:
+    """One keepalive beat: prove the session is alive, then save the rotated jar."""
+    client = _state.client
+    if client is None:
+        return
+    try:
+        await client.get_json("/api/v1/users/self")
+    except AuthError:
+        # Don't reconnect from a background task - just make the next tool call
+        # revalidate, which reconnects with the student's attention on it.
+        _state.revalidate_after = 0.0
+        return
+    except CanvasMCPError:
+        return  # transient; try again next tick
+    try:
+        auth.refresh_stored_cookies(client.base_url, client.current_cookies())
+    except OSError:
+        pass
+
+
+async def _keepalive_loop(interval: int) -> None:
+    """Keep the borrowed session from idling out.
+
+    A Rails session expires on inactivity, so a student who asks about Canvas once a
+    day would find it dead every time. Touching a cheap endpoint on a timer keeps it
+    alive for as long as this server runs, and saving the rotated cookies means the
+    freshness survives a restart too.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        await _keepalive_tick()
+
+
+def _ensure_keepalive() -> None:
+    if _state.keepalive is not None and not _state.keepalive.done():
+        return
+    interval = _keepalive_interval()
+    if interval <= 0:
+        return
+    try:
+        _state.keepalive = asyncio.create_task(_keepalive_loop(interval))
+    except RuntimeError:  # pragma: no cover - no running loop (unit tests)
+        _state.keepalive = None
 
 
 async def _get_client() -> CanvasClient:
@@ -101,6 +164,7 @@ async def _get_client() -> CanvasClient:
         _state.profile = connection.profile
         _state.source = connection.credentials.source
         _state.revalidate_after = time.monotonic() + REVALIDATE_SECONDS
+        _ensure_keepalive()
         return _state.client
 
 
@@ -118,21 +182,44 @@ def _tz():
     return resolve_timezone(_state.profile.get("time_zone"))
 
 
-def handle_errors(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
-    """Turn expected failures into helpful prose instead of protocol errors."""
+def handle_errors(
+    fn: Callable[..., Awaitable[str]] | None = None, *, reconnect: bool = True
+) -> Any:
+    """Turn expected failures into helpful prose instead of protocol errors.
 
-    @functools.wraps(fn)
-    async def wrapper(*args: Any, **kwargs: Any) -> str:
-        try:
-            return await fn(*args, **kwargs)
-        except AuthError as exc:
-            return f"Not connected to Canvas.\n\n{exc.full_message()}"
-        except CanvasMCPError as exc:
-            return str(exc)
-        except Exception as exc:  # pragma: no cover - last line of defence
-            return f"Something went wrong talking to Canvas: {exc.__class__.__name__}: {exc}"
+    On an expired session this quietly re-establishes the connection and runs the
+    tool again, so a cookie dying mid-conversation costs the student nothing. Set
+    ``reconnect=False`` on the tools that manage the connection themselves.
+    """
 
-    return wrapper
+    def decorate(inner: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
+        @functools.wraps(inner)
+        async def wrapper(*args: Any, **kwargs: Any) -> str:
+            try:
+                return await inner(*args, **kwargs)
+            except AuthError as exc:
+                if not reconnect:
+                    return f"Not connected to Canvas.\n\n{exc.full_message()}"
+            except CanvasMCPError as exc:
+                return str(exc)
+            except Exception as exc:  # pragma: no cover - last line of defence
+                return f"Something went wrong talking to Canvas: {exc.__class__.__name__}: {exc}"
+
+            # Second attempt, on a freshly established session.
+            try:
+                await _reset_client()
+                await _get_client()
+                return await inner(*args, **kwargs)
+            except AuthError as exc:
+                return f"Not connected to Canvas.\n\n{exc.full_message()}"
+            except CanvasMCPError as exc:
+                return str(exc)
+            except Exception as exc:  # pragma: no cover
+                return f"Something went wrong talking to Canvas: {exc.__class__.__name__}: {exc}"
+
+        return wrapper
+
+    return decorate(fn) if fn is not None else decorate
 
 
 # --------------------------------------------------------------------------- #
@@ -165,11 +252,6 @@ def _abs_url(client: CanvasClient, url: Any) -> str:
     if not url or not isinstance(url, str):
         return ""
     return url if url.startswith("http") else urljoin(client.base_url + "/", url.lstrip("/"))
-
-
-async def _courses_by_id(client: CanvasClient, *, include_concluded: bool = False) -> dict[str, dict[str, Any]]:
-    courses = await client.courses(include_concluded=include_concluded)
-    return {str(c["id"]): c for c in courses}
 
 
 async def _resolve_assignment(client: CanvasClient, course_id: Any, reference: str) -> dict[str, Any]:
@@ -246,7 +328,7 @@ def _require_writes() -> None:
 # --------------------------------------------------------------------------- #
 
 @mcp.tool()
-@handle_errors
+@handle_errors(reconnect=False)
 async def canvas_status() -> str:
     """Check whether Canvas is connected, and as whom. Start here."""
     stored = config.load_session()
@@ -274,7 +356,7 @@ async def canvas_status() -> str:
 
 
 @mcp.tool()
-@handle_errors
+@handle_errors(reconnect=False)
 async def connect(base_url: str = "", session_cookie: str = "") -> str:
     """Connect to Canvas without an API key.
 
@@ -304,7 +386,7 @@ async def connect(base_url: str = "", session_cookie: str = "") -> str:
 
 
 @mcp.tool()
-@handle_errors
+@handle_errors(reconnect=False)
 async def browser_login(base_url: str) -> str:
     """Open a browser window so the student can log in through their school's normal
     sign-in page (SSO, 2-factor, whatever). Use this when `connect` cannot find a
@@ -335,7 +417,7 @@ async def browser_login(base_url: str) -> str:
 
 
 @mcp.tool()
-@handle_errors
+@handle_errors(reconnect=False)
 async def disconnect() -> str:
     """Forget the saved Canvas session on this computer."""
     await _reset_client()
@@ -376,44 +458,10 @@ async def list_courses(include_concluded: bool = False) -> str:
     return "\n".join(lines)
 
 
-async def _planner_items(client: CanvasClient, start: datetime, end: datetime) -> list[dict[str, Any]]:
-    return await client.paginate(
-        "/api/v1/planner/items",
-        {
-            "start_date": start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "end_date": end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        },
-        limit=300,
-    )
-
-
-def _item_done(item: dict[str, Any]) -> bool:
-    override = item.get("planner_override") or {}
-    if override.get("marked_complete") or override.get("dismissed"):
-        return True
-    submissions = item.get("submissions")
-    if isinstance(submissions, dict):
-        return bool(submissions.get("submitted") or submissions.get("excused") or submissions.get("graded"))
-    return False
-
-
-_TYPE_LABEL = {
-    "assignment": "assignment",
-    "quiz": "quiz",
-    "discussion_topic": "discussion",
-    "announcement": "announcement",
-    "wiki_page": "page",
-    "planner_note": "to-do",
-    "calendar_event": "event",
-    "assessment_request": "peer review",
-    "sub_assignment": "assignment",
-}
-
-
 def _planner_line(item: dict[str, Any], courses: dict[str, dict[str, Any]], tz) -> str:
     plannable = item.get("plannable") or {}
     title = plannable.get("title") or plannable.get("name") or "(untitled)"
-    kind = _TYPE_LABEL.get(str(item.get("plannable_type")), str(item.get("plannable_type") or "item"))
+    kind = queries.TYPE_LABEL.get(str(item.get("plannable_type")), str(item.get("plannable_type") or "item"))
     course = courses.get(str(item.get("course_id") or ""))
     when = parse_iso(item.get("plannable_date"))
     clock = when.astimezone(tz).strftime("%-I:%M %p" if os.name != "nt" else "%I:%M %p") if when else "--"
@@ -454,7 +502,7 @@ async def upcoming(days: int = 14, include_done: bool = False, course: str = "")
     client = await _get_client()
     tz = _tz()
     now = datetime.now(timezone.utc)
-    courses = await _courses_by_id(client)
+    courses = await queries.courses_by_id(client)
 
     course_filter: str | None = None
     if course:
@@ -462,17 +510,16 @@ async def upcoming(days: int = 14, include_done: bool = False, course: str = "")
         course_filter = str(resolved.get("id"))
 
     try:
-        items = await _planner_items(client, now - timedelta(hours=12), now + timedelta(days=days))
+        items = await queries.planner_items(client, days=days)
     except CanvasMCPError:
         items = []
 
     if items:
-        rows = [i for i in items if isinstance(i, dict)]
+        rows = queries.open_items(items) if not include_done else [
+            i for i in items if str(i.get("plannable_type")) != "announcement"
+        ]
         if course_filter:
             rows = [i for i in rows if str(i.get("course_id") or "") == course_filter]
-        if not include_done:
-            rows = [i for i in rows if not _item_done(i)]
-        rows = [i for i in rows if str(i.get("plannable_type")) != "announcement"]
         rows.sort(key=lambda i: parse_iso(i.get("plannable_date")) or now)
 
         if not rows:
@@ -558,7 +605,7 @@ async def missing_work() -> str:
     The honest answer to "how far behind am I?".
     """
     client = await _get_client()
-    courses = await _courses_by_id(client)
+    courses = await queries.courses_by_id(client)
     missing = await client.paginate(
         "/api/v1/users/self/missing_submissions",
         {"include[]": ["planner_overrides"], "filter[]": ["submittable"]},
@@ -974,22 +1021,14 @@ async def list_files(course: str, search: str = "", limit: int = 40) -> str:
 async def download_file(file_id: str, dest_dir: str = "") -> str:
     """Download a course file to this computer so it can be read or worked with."""
     client = await _get_client()
-    info = await client.get_json(f"/api/v1/files/{file_id}")
-    if not isinstance(info, dict) or not info.get("url"):
-        return f"File {file_id} has no downloadable URL (it may be locked)."
-
-    size = int(info.get("size") or 0)
-    if size > 100 * 1_048_576:
-        return f"{info.get('display_name')} is {size / 1_048_576:.0f} MB - too large to pull down automatically."
-
     target_dir = Path(dest_dir).expanduser() if dest_dir else Path.home() / "Downloads" / "canvas"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^\w\s.\-()]+", "_", str(info.get("display_name") or f"canvas-{file_id}")).strip()
-    target = target_dir / (safe_name or f"canvas-{file_id}")
-
-    response = await client.request("GET", info["url"])
-    target.write_bytes(response.content)
-    return f"Saved {target} ({len(response.content) / 1024:.0f} KB)."
+    target, _info = await _fetch_file(client, file_id, target_dir)
+    size_kb = target.stat().st_size / 1024
+    suffix = target.suffix.lower()
+    hint = ""
+    if suffix in documents.supported_suffixes():
+        hint = "\nUse `read_file` on the same id to read it as text."
+    return f"Saved {target} ({size_kb:.0f} KB).{hint}"
 
 
 @mcp.tool()
@@ -1005,7 +1044,7 @@ async def announcements(course: str = "", days: int = 21) -> str:
         context_codes = [f"course_{resolved['id']}"]
         courses = {str(resolved["id"]): resolved}
     else:
-        courses = await _courses_by_id(client)
+        courses = await queries.courses_by_id(client)
         context_codes = [f"course_{cid}" for cid in courses]
     if not context_codes:
         return "No courses to read announcements from."
@@ -1155,7 +1194,7 @@ async def todo_list() -> str:
     """Canvas's own to-do list plus any personal notes the student has added to the planner."""
     client = await _get_client()
     tz = _tz()
-    courses = await _courses_by_id(client)
+    courses = await queries.courses_by_id(client)
 
     todos, notes = await asyncio.gather(
         client.paginate("/api/v1/users/self/todo", limit=60),
@@ -1278,6 +1317,460 @@ async def mark_done(item_type: str, item_id: str, done: bool = True) -> str:
             {"plannable_type": kind, "plannable_id": str(item_id), "marked_complete": str(done).lower()},
         )
     return f"{kind.replace('_', ' ')} {item_id} marked {'done' if done else 'not done'} in your planner."
+
+
+# --------------------------------------------------------------------------- #
+# Grade arithmetic
+# --------------------------------------------------------------------------- #
+
+async def _standing_for(client: CanvasClient, course: dict[str, Any]):
+    """Fetch a course's assignment groups and reduce them to a grade standing."""
+    course_id = course["id"]
+    detail, groups = await queries.gather(
+        client.get_json(
+            f"/api/v1/courses/{course_id}",
+            {"include[]": ["total_scores", "term"]},
+        ),
+        queries.assignment_groups(client, course_id),
+    )
+    detail = detail if isinstance(detail, dict) else course
+    if not groups:
+        raise CanvasMCPError(
+            f"Canvas would not show me the assignment groups for {_course_label(course)}, "
+            "so I cannot do the grade maths for it."
+        )
+    weighted = bool(detail.get("apply_assignment_group_weights"))
+    standing = gradecalc.summarize(groups, weighted=weighted)
+    scheme = await queries.grading_scheme(client, detail)
+    return standing, scheme, detail, groups
+
+
+def _pct(value: float | None) -> str:
+    return "-" if value is None else f"{value * 100:.1f}%"
+
+
+@mcp.tool()
+@handle_errors
+async def grade_forecast(course: str, target: str = "") -> str:
+    """What this course's grade really is, and what you need on what's left.
+
+    Answers "can I still get a B?" properly - using the assignment group weights, so
+    a 10-point quiz in a 5%-weighted group is treated as the rounding error it is.
+    target accepts a letter ("B") or a percentage ("85"); omit it to see what each
+    grade above your current one would take.
+    """
+    client = await _get_client()
+    resolved = await client.resolve_course(course)
+    standing, scheme, detail, _groups = await _standing_for(client, resolved)
+
+    current = standing.current
+    out = [f"{_course_label(detail)} - grade forecast", ""]
+    out.append(f"Current grade:    {_pct(current)} ({gradecalc.letter_for(current, scheme)})")
+    out.append(
+        f"Graded so far:    {standing.earned:g} / {standing.graded_possible:g} points"
+        f" across {sum(g.graded_count for g in standing.groups)} assignments"
+    )
+    out.append(
+        f"Still to come:    {standing.remaining:g} points"
+        f" across {sum(g.remaining_count for g in standing.groups)} assignments"
+    )
+    out.append(f"Grading:          {'weighted by group' if standing.weighted else 'straight points'}")
+
+    if standing.remaining > 0:
+        floor = standing.projected(0.0)
+        ceiling = standing.projected(1.0)
+        out.append("")
+        out.append(f"If you do nothing else:  {_pct(floor)} ({gradecalc.letter_for(floor, scheme)})")
+        out.append(f"If you ace everything:   {_pct(ceiling)} ({gradecalc.letter_for(ceiling, scheme)})")
+
+    if standing.weighted:
+        out.extend(["", "Where the weight sits", "---------------------"])
+        for group in sorted(standing.groups, key=lambda g: -g.weight):
+            if group.total_possible <= 0 and group.weight <= 0:
+                continue
+            piece = f"- {group.name}: {group.weight:g}% of the grade"
+            if group.percentage is not None:
+                piece += f" - you're at {_pct(group.percentage)}"
+            else:
+                piece += " - nothing graded yet"
+            if group.remaining > 0:
+                piece += f", {group.remaining:g} points left"
+            out.append(piece)
+
+    out.extend(["", "What you'd need on everything remaining", "---------------------------------------"])
+    if standing.remaining <= 0:
+        out.append("Nothing left to submit - this grade is final.")
+        return "\n".join(out)
+
+    targets = _forecast_targets(target, current, scheme)
+    if not targets:
+        out.append(f'I could not read "{target}" as a letter grade or a percentage.')
+        return "\n".join(out)
+
+    for label, cutoff in targets:
+        needed = standing.needed_for(cutoff)
+        if needed is None:
+            out.append(f"- {label} ({cutoff * 100:g}%): can't be computed")
+        elif needed <= 0:
+            out.append(f"- {label} ({cutoff * 100:g}%): already locked in, even at zero from here")
+        elif needed > 1.0:
+            short = (cutoff - (standing.projected(1.0) or 0)) * 100
+            out.append(
+                f"- {label} ({cutoff * 100:g}%): out of reach - {short:.1f} points of grade short"
+                " even with perfect scores"
+            )
+        else:
+            out.append(f"- {label} ({cutoff * 100:g}%): average {_pct(needed)} on the remaining work")
+
+    out.append("")
+    out.append("That assumes every remaining assignment is graded and counts. Use `what_if` to test a single score.")
+    return "\n".join(out)
+
+
+def _forecast_targets(
+    target: str, current: float | None, scheme: list[tuple[str, float]]
+) -> list[tuple[str, float]]:
+    """Either the grade the student asked about, or every grade above where they are."""
+    text = (target or "").strip()
+    if text:
+        for name, cutoff in scheme:
+            if name.lower() == text.lower():
+                return [(name, cutoff)]
+        cleaned = text.rstrip("%")
+        try:
+            value = float(cleaned)
+        except ValueError:
+            return []
+        fraction = value / 100 if value > 1 else value
+        return [(f"{fraction * 100:g}%", fraction)]
+
+    reachable = [
+        (name, cutoff) for name, cutoff in scheme
+        if cutoff > 0 and (current is None or cutoff > current)
+    ]
+    reachable.sort(key=lambda pair: pair[1])
+    return reachable[:4] or [(scheme[0][0], scheme[0][1])]
+
+
+@mcp.tool()
+@handle_errors
+async def what_if(course: str, assignment: str, score: float) -> str:
+    """Try a hypothetical score on one assignment and see the grade move.
+
+    Useful before deciding how much to sweat something: "if I get 30/50 on this,
+    where do I land?"
+    """
+    client = await _get_client()
+    resolved = await client.resolve_course(course)
+    standing, scheme, detail, groups = await _standing_for(client, resolved)
+
+    # The groups payload already carries every assignment, so look there first:
+    # it saves a round trip and still works when the detail endpoint is restricted.
+    group_id, target = _find_in_groups(groups, assignment)
+    if target is None:
+        target = await _resolve_assignment(client, resolved["id"], assignment)
+        group_id = str(target.get("assignment_group_id") or "") or next(
+            (str(g.get("id")) for g in groups if _group_holds(g, target)), ""
+        )
+    points = float(target.get("points_possible") or 0)
+    if not group_id or not any(g.id == group_id for g in standing.groups):
+        return f"I couldn't work out which assignment group \"{target.get('name')}\" belongs to."
+
+    before = standing.current
+    after_standing = gradecalc.with_hypothetical(standing, group_id, points, float(score))
+    after = after_standing.current
+    impact = standing.impact(group_id, points)
+
+    out = [f"{target.get('name')} - {_course_label(detail)}", ""]
+    out.append(f"Scoring {score:g} out of {points:g}:")
+    out.append(f"  grade now:   {_pct(before)} ({gradecalc.letter_for(before, scheme)})")
+    out.append(f"  grade after: {_pct(after)} ({gradecalc.letter_for(after, scheme)})")
+    if before is not None and after is not None:
+        delta = (after - before) * 100
+        out.append(f"  change:      {delta:+.2f} points of final grade")
+    if impact is not None:
+        out.append("")
+        out.append(f"This assignment is worth {impact * 100:.1f}% of your final grade in this course.")
+    return "\n".join(out)
+
+
+def _find_in_groups(
+    groups: list[dict[str, Any]], reference: str
+) -> tuple[str, dict[str, Any] | None]:
+    """Locate an assignment inside the assignment_groups payload by id or name."""
+    ref = str(reference).strip().lower()
+    pairs = [
+        (str(group.get("id")), a)
+        for group in groups
+        for a in group.get("assignments") or []
+        if isinstance(a, dict)
+    ]
+    for group_id, a in pairs:
+        if str(a.get("id")).lower() == ref or str(a.get("name", "")).lower() == ref:
+            return group_id, a
+
+    partial = [(gid, a) for gid, a in pairs if ref and ref in str(a.get("name", "")).lower()]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        options = "\n".join(f"  - {a.get('name')} (id {a.get('id')})" for _gid, a in partial[:12])
+        raise CanvasMCPError(f'"{reference}" matches several assignments:\n{options}')
+    return "", None
+
+
+def _group_holds(group: dict[str, Any], assignment: dict[str, Any]) -> bool:
+    return any(
+        str(a.get("id")) == str(assignment.get("id"))
+        for a in group.get("assignments") or []
+        if isinstance(a, dict)
+    )
+
+
+@mcp.tool()
+@handle_errors
+async def triage() -> str:
+    """Rank every piece of missing work by how much it actually costs your grade.
+
+    Points alone are misleading - a 100-point assignment in a lightly weighted group
+    can matter less than a 20-point one that isn't. This sorts by real grade impact
+    and says which ones Canvas will still accept.
+    """
+    client = await _get_client()
+    now = datetime.now(timezone.utc)
+    courses, missing = await queries.gather(
+        queries.courses_by_id(client), queries.missing_submissions(client)
+    )
+    courses = courses or {}
+    missing = missing or []
+    if not missing:
+        return "Nothing is missing. Everything past due has been submitted or excused."
+
+    course_ids = {str(m.get("course_id")) for m in missing if m.get("course_id")}
+    standings: dict[str, Any] = {}
+    for course_id in course_ids:
+        course = courses.get(course_id)
+        if not course:
+            continue
+        try:
+            standings[course_id] = await _standing_for(client, course)
+        except CanvasMCPError:
+            continue
+
+    rows: list[tuple[float, str]] = []
+    for item in missing:
+        course_id = str(item.get("course_id") or "")
+        course = courses.get(course_id)
+        points = float(item.get("points_possible") or 0)
+        lock_at = parse_iso(item.get("lock_at"))
+        open_still = lock_at is None or lock_at > now
+
+        impact = None
+        entry = standings.get(course_id)
+        if entry:
+            standing, _scheme, _detail, groups = entry
+            group_id = next(
+                (str(g.get("id")) for g in groups if _group_holds(g, item)), ""
+            )
+            if group_id:
+                impact = standing.impact(group_id, points)
+
+        cost = (impact or 0) * 100
+        label = (
+            f"- [{_short_label(course)}] {item.get('name')} - {points_label(points) or 'ungraded'}"
+        )
+        if impact is not None:
+            label += f" - worth {cost:.1f}% of the course grade"
+        label += (
+            f" - {'still open' + (f', closes {humanize_delta(lock_at)}' if lock_at else '') if open_still else 'CLOSED'}"
+            f" [assignment {item.get('id')}]"
+        )
+        # Work that can still be handed in outranks work that cannot, whatever it's worth.
+        rows.append(((1000 if open_still else 0) + cost, label))
+
+    rows.sort(key=lambda row: -row[0])
+    out = [f"{len(missing)} missing assignments, ranked by what they cost you:", ""]
+    out.extend(label for _score, label in rows)
+
+    out.append("")
+    out.append("Where each course lands if none of this gets done:")
+    for entry in standings.values():
+        standing, scheme, detail, _groups = entry
+        floor = standing.projected(0.0)
+        ceiling = standing.projected(1.0)
+        out.append(
+            f"- {_course_label(detail)}: now {_pct(standing.current)}"
+            f" | do nothing more {_pct(floor)} ({gradecalc.letter_for(floor, scheme)})"
+            f" | finish everything {_pct(ceiling)} ({gradecalc.letter_for(ceiling, scheme)})"
+        )
+    return "\n".join(out)
+
+
+@mcp.tool()
+@handle_errors
+async def crunch_check(days: int = 21) -> str:
+    """Find the weeks where deadlines pile up, while there's still time to start early."""
+    days = max(1, min(int(days), 120))
+    client = await _get_client()
+    tz = _tz()
+    courses, items = await queries.gather(
+        queries.courses_by_id(client), queries.planner_items(client, days=days)
+    )
+    pending = queries.open_items(items or [])
+    clusters = queries.find_crunches(pending)
+    if not clusters:
+        return f"No pile-ups in the next {days} days - the workload is fairly even."
+
+    out = [f"Busy stretches in the next {days} days:", ""]
+    for cluster in clusters:
+        when = format_day(cluster["start"].isoformat(), tz)
+        out.append(f"{when} onwards - {len(cluster['items'])} items, {cluster['points']:g} points")
+        for item in cluster["items"]:
+            course = (courses or {}).get(str(item.get("course_id") or ""))
+            out.append(
+                f"  - [{_short_label(course)}] {queries.item_title(item)}"
+                f" - {format_due(item.get('plannable_date'), tz)}"
+            )
+        out.append("")
+    out.append("Starting the biggest of these a few days early is usually the whole difference.")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Course materials
+# --------------------------------------------------------------------------- #
+
+async def _fetch_file(client: CanvasClient, file_id: str, dest_dir: Path) -> tuple[Path, dict[str, Any]]:
+    info = await client.get_json(f"/api/v1/files/{file_id}")
+    if not isinstance(info, dict) or not info.get("url"):
+        raise CanvasMCPError(f"File {file_id} has no downloadable URL (it may be locked).")
+
+    size = int(info.get("size") or 0)
+    if size > 100 * 1_048_576:
+        raise CanvasMCPError(
+            f"{info.get('display_name')} is {size / 1_048_576:.0f} MB - too large to pull down automatically."
+        )
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^\w\s.\-()]+", "_", str(info.get("display_name") or f"canvas-{file_id}")).strip()
+    target = dest_dir / (safe_name or f"canvas-{file_id}")
+    response = await client.request("GET", info["url"])
+    target.write_bytes(response.content)
+    return target, info
+
+
+def _materials_cache() -> Path:
+    return config.config_dir() / "files"
+
+
+@mcp.tool()
+@handle_errors
+async def read_file(file_id: str, max_chars: int = 20000) -> str:
+    """Read a course file as text - lecture slides, a reading, a handout.
+
+    Downloads it and extracts the text, so the content can actually be discussed
+    rather than just located. Handles PDF, Word, PowerPoint, HTML, CSV and plain text.
+    """
+    client = await _get_client()
+    path, info = await _fetch_file(client, file_id, _materials_cache())
+    text = documents.extract_text(path, limit=max(500, min(int(max_chars), 200_000)))
+    header = f"{info.get('display_name')} ({path.suffix.lstrip('.') or 'file'}, saved to {path})"
+    return f"{header}\n{'-' * len(header)}\n\n{text}"
+
+
+@mcp.tool()
+@handle_errors
+async def read_assignment_attachments(course: str, assignment: str, max_chars: int = 15000) -> str:
+    """Read the files attached to an assignment - the brief, the template, the dataset."""
+    client = await _get_client()
+    resolved = await client.resolve_course(course)
+    data = await _resolve_assignment(client, resolved["id"], assignment)
+
+    urls = re.findall(r"/files/(\d+)", str(data.get("description") or ""))
+    unique = list(dict.fromkeys(urls))
+    if not unique:
+        return (
+            f"No files are attached to \"{data.get('name')}\". "
+            "The instructions themselves are in `get_assignment`."
+        )
+
+    budget = max(500, min(int(max_chars), 100_000))
+    chunks: list[str] = []
+    for file_id in unique[:5]:
+        try:
+            path, info = await _fetch_file(client, file_id, _materials_cache())
+            text = documents.extract_text(path, limit=budget // min(len(unique), 5))
+            chunks.append(f"### {info.get('display_name')}\n\n{text}")
+        except CanvasMCPError as exc:
+            chunks.append(f"### file {file_id}\n\n(could not read: {exc})")
+    return f"Attachments on {data.get('name')}\n\n" + "\n\n".join(chunks)
+
+
+# --------------------------------------------------------------------------- #
+# Getting deadlines out of Canvas and in front of the student
+# --------------------------------------------------------------------------- #
+
+@mcp.tool()
+@handle_errors
+async def export_calendar(days: int = 120, path: str = "") -> str:
+    """Write every upcoming deadline to a .ics file for Google or Apple Calendar.
+
+    This is how deadlines reach a student who never opens Canvas: import once and
+    they show up on the phone, with reminders a day and two hours before.
+    """
+    days = max(1, min(int(days), 365))
+    client = await _get_client()
+    courses, items = await queries.gather(
+        queries.courses_by_id(client), queries.planner_items(client, days=days, lookback_hours=0)
+    )
+    pending = queries.open_items(items or [])
+    if not pending:
+        return f"Nothing due in the next {days} days, so there is nothing to export."
+
+    entries = []
+    for item in pending:
+        when = parse_iso(item.get("plannable_date"))
+        if when is None:
+            continue
+        course = (courses or {}).get(str(item.get("course_id") or ""))
+        kind = queries.TYPE_LABEL.get(str(item.get("plannable_type")), "item")
+        points = points_label((item.get("plannable") or {}).get("points_possible"))
+        entries.append(
+            ics.CalendarItem(
+                summary=f"{_short_label(course)}: {queries.item_title(item)}",
+                start=when,
+                uid_seed=f"{item.get('plannable_type')}-{item.get('plannable_id')}",
+                description=f"{kind}{f' worth {points}' if points else ''} - due in Canvas",
+                url=_abs_url(client, item.get("html_url")),
+                categories=[_short_label(course)],
+            )
+        )
+
+    target = Path(path).expanduser() if path else Path.home() / "Downloads" / "canvas-deadlines.ics"
+    if target.is_dir():
+        target = target / "canvas-deadlines.ics"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(ics.build_calendar(entries), encoding="utf-8")
+
+    return (
+        f"Wrote {len(entries)} deadlines to {target}.\n\n"
+        "To use it:\n"
+        "  Google Calendar - Settings > Import & export > Import, pick the file\n"
+        "  Apple Calendar  - File > Import, pick the file\n"
+        "  Phone           - email the file to yourself and open the attachment\n\n"
+        "Each event carries reminders a day and two hours before. Re-run this to refresh it; "
+        "events keep stable ids, so re-importing updates rather than duplicates."
+    )
+
+
+@mcp.tool()
+@handle_errors
+async def daily_digest(days: int = 7) -> str:
+    """A short brief: what's imminent, what's missing, where the pile-ups are.
+
+    The same text `canvas-mcp digest` prints, which can be run from cron.
+    """
+    client = await _get_client()
+    return await digest.build_digest(client, days=max(1, min(int(days), 60)), tz=_tz())
 
 
 # --------------------------------------------------------------------------- #

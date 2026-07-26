@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     setc.add_argument("--base-url", default="", help="https://yourschool.instructure.com")
     setc.add_argument("--cookie", default="", help="Cookie value (omit to be prompted, which hides it).")
 
+    brief = sub.add_parser("digest", help="Print a short brief of what's due and what's missing.")
+    brief.add_argument("--days", type=int, default=7, help="How far ahead to look.")
+
+    cal = sub.add_parser("ics", help="Export upcoming deadlines as a calendar file.")
+    cal.add_argument("--days", type=int, default=120, help="How far ahead to export.")
+    cal.add_argument("--out", default="", help="Where to write the .ics (default ~/Downloads).")
+
     sub.add_parser("status", help="Show the saved session and check that it still works.")
     sub.add_parser("logout", help="Delete the saved session.")
     sub.add_parser("doctor", help="Diagnose why connecting isn't working.")
@@ -66,6 +73,10 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(cmd_import(args))
         if command == "set-cookie":
             return asyncio.run(cmd_set_cookie(args))
+        if command == "digest":
+            return asyncio.run(cmd_digest(args))
+        if command == "ics":
+            return asyncio.run(cmd_ics(args))
         if command == "status":
             return asyncio.run(cmd_status())
         if command == "logout":
@@ -140,6 +151,67 @@ async def cmd_set_cookie(args: Any) -> int:
     return 0
 
 
+async def _connected_client():
+    """A validated client for the one-shot commands, or a clear failure."""
+    from .client import CanvasClient
+
+    connection, _notes = await auth.connect(allow_browser_scan=config.auto_import_enabled())
+    return CanvasClient(connection.credentials), connection
+
+
+async def cmd_digest(args: Any) -> int:
+    from .digest import build_digest
+    from .formatting import resolve_timezone
+
+    client, connection = await _connected_client()
+    try:
+        tz = resolve_timezone(connection.profile.get("time_zone"))
+        print(await build_digest(client, days=max(1, args.days), tz=tz))
+    finally:
+        await client.aclose()
+    return 0
+
+
+async def cmd_ics(args: Any) -> int:
+    from pathlib import Path
+
+    from . import ics, queries
+    from .formatting import parse_iso
+
+    client, _connection = await _connected_client()
+    try:
+        courses = await queries.courses_by_id(client)
+        items = queries.open_items(
+            await queries.planner_items(client, days=max(1, args.days), lookback_hours=0)
+        )
+        entries = []
+        for item in items:
+            when = parse_iso(item.get("plannable_date"))
+            if when is None:
+                continue
+            course = courses.get(str(item.get("course_id") or ""))
+            code = (course or {}).get("course_code") or (course or {}).get("name") or "Canvas"
+            entries.append(
+                ics.CalendarItem(
+                    summary=f"{code}: {queries.item_title(item)}",
+                    start=when,
+                    uid_seed=f"{item.get('plannable_type')}-{item.get('plannable_id')}",
+                    description="Due in Canvas",
+                    categories=[str(code)],
+                )
+            )
+    finally:
+        await client.aclose()
+
+    target = Path(args.out).expanduser() if args.out else Path.home() / "Downloads" / "canvas-deadlines.ics"
+    if target.is_dir():
+        target = target / "canvas-deadlines.ics"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(ics.build_calendar(entries), encoding="utf-8")
+    print(f"Wrote {len(entries)} deadlines to {target}")
+    return 0
+
+
 async def cmd_status() -> int:
     stored = config.load_session()
     if stored is None:
@@ -184,6 +256,15 @@ async def cmd_doctor() -> int:
         print("  playwright      : installed")
     except ImportError:
         print("  playwright      : missing (`canvas-mcp login` unavailable)")
+
+    from . import documents
+
+    readable = ", ".join(name for name, ok in documents.available_readers().items() if ok) or "none"
+    unreadable = [name for name, ok in documents.available_readers().items() if not ok]
+    print(f"  file reading    : {readable}")
+    if unreadable:
+        print(f"                    missing {', '.join(unreadable)} "
+              "(pip install 'canvas-mcp[documents]')")
 
     print("\nBrowsers on this machine")
     sessions, notes = browser_cookies.discover_sessions()

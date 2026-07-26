@@ -21,8 +21,16 @@ dependencies = [
 browsers = ["browser-cookie3>=0.19.1"]
 # Pop open a real browser window so you can log in through your school's SSO.
 login = ["playwright>=1.40"]
-all = ["browser-cookie3>=0.19.1", "playwright>=1.40"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+# Read the text out of slides, readings and handouts.
+documents = ["pypdf>=4.0", "python-docx>=1.1", "python-pptx>=0.6.23"]
+all = [
+    "browser-cookie3>=0.19.1",
+    "playwright>=1.40",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "python-pptx>=0.6.23",
+]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "icalendar>=5"]
 
 [project.scripts]
 canvas-mcp = "canvas_mcp.cli:main"

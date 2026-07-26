@@ -32,6 +32,7 @@ COURSES = [
         "course_code": "BIO 101",
         "term": {"name": "Spring 2026"},
         "teachers": [{"display_name": "Dr. Okafor"}],
+        "apply_assignment_group_weights": True,
         "enrollments": [
             {
                 "enrollment_state": "active",
@@ -122,6 +123,66 @@ PLANNER_ITEMS = [
     },
 ]
 
+# Weighted groups for BIO 101: quizzes are 40% of the grade, the lab report 60%.
+ASSIGNMENT_GROUPS = {
+    "101": [
+        {
+            "id": "g1",
+            "name": "Quizzes",
+            "group_weight": 40,
+            "assignments": [
+                {
+                    "id": "1002",
+                    "name": "Reading Quiz 3",
+                    "points_possible": 10,
+                    "assignment_group_id": "g1",
+                    "submission": {"workflow_state": "graded", "score": 9},
+                }
+            ],
+        },
+        {
+            "id": "g2",
+            "name": "Lab reports",
+            "group_weight": 60,
+            "assignments": [
+                {
+                    "id": "1001",
+                    "name": "Cell Structure Lab Report",
+                    "points_possible": 50,
+                    "assignment_group_id": "g2",
+                    "submission": {"workflow_state": "unsubmitted"},
+                }
+            ],
+        },
+    ],
+    "202": [
+        {
+            "id": "g3",
+            "name": "Essays",
+            "group_weight": 100,
+            "assignments": [
+                {
+                    "id": "2001",
+                    "name": "Essay 2 Draft",
+                    "points_possible": 100,
+                    "assignment_group_id": "g3",
+                    "submission": {"workflow_state": "unsubmitted", "missing": True},
+                }
+            ],
+        }
+    ],
+}
+
+FILES = {
+    "9001": {
+        "id": "9001",
+        "display_name": "week6-slides.txt",
+        "size": 64,
+        "url": f"{HOST}/files/9001/download?verifier=abc",
+    }
+}
+FILE_BODIES = {"9001": b"Slide 1: Cell structure\nSlide 2: Staining protocol\n"}
+
 MISSING = [
     {
         "id": "2001",
@@ -173,6 +234,8 @@ class FakeCanvas:
             "/api/v1/planner/items": lambda r: httpx.Response(200, json=PLANNER_ITEMS),
             "/api/v1/planner_notes": self._planner_notes,
             "/api/v1/courses/*": self._course_scoped,
+            "/api/v1/files/*": self._files,
+            "/files/*": self._file_download,
         }
 
     def _courses(self, request: httpx.Request) -> httpx.Response:
@@ -218,6 +281,9 @@ class FakeCanvas:
             ]
             return httpx.Response(200, json=payload)
 
+        if rest[0] == "assignment_groups":
+            return httpx.Response(200, json=ASSIGNMENT_GROUPS.get(course_id, []))
+
         if rest[0] == "modules":
             return httpx.Response(
                 200,
@@ -235,6 +301,18 @@ class FakeCanvas:
             )
 
         return httpx.Response(404, json={"errors": [{"message": "not found"}]})
+
+    def _files(self, request: httpx.Request) -> httpx.Response:
+        file_id = request.url.path.rstrip("/").split("/")[-1]
+        info = FILES.get(file_id)
+        return httpx.Response(200, json=info) if info else httpx.Response(404, json={})
+
+    def _file_download(self, request: httpx.Request) -> httpx.Response:
+        file_id = request.url.path.strip("/").split("/")[1]
+        body = FILE_BODIES.get(file_id)
+        if body is None:
+            return httpx.Response(404, json={})
+        return httpx.Response(200, content=body, headers={"Content-Type": "text/plain"})
 
     def _planner_notes(self, request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
