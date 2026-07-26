@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "canvas-mcp"
+version = "0.1.0"
+description = "MCP server for Canvas LMS that works without an API key, by reusing the browser session you already have"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "canvas", "lms", "instructure", "students"]
+
+dependencies = [
+    "mcp>=1.9.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Pull the Canvas session straight out of an already-logged-in browser.
+browsers = ["browser-cookie3>=0.19.1"]
+# Pop open a real browser window so you can log in through your school's SSO.
+login = ["playwright>=1.40"]
+all = ["browser-cookie3>=0.19.1", "playwright>=1.40"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+canvas-mcp = "canvas_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/canvas_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
