@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp < 2
+    from mcp.server.fastmcp import FastMCP as MCPServer
+
+    _MCP_V2 = False
+except ImportError:  # mcp >= 2 renamed FastMCP to MCPServer
+    from mcp.server.mcpserver import MCPServer
+
+    _MCP_V2 = True
 
 from . import __version__, auth, config, digest, documents, gradecalc, ics, queries
 from .client import CanvasClient, chunked
@@ -68,11 +75,16 @@ submit assignments, post replies, or take quizzes, and should not be asked to
 produce work the student is supposed to write themselves.
 """
 
-mcp = FastMCP("canvas", instructions=INSTRUCTIONS)
+mcp = MCPServer(
+    "canvas",
+    instructions=INSTRUCTIONS,
+    **({"version": __version__} if _MCP_V2 else {}),
+)
 
-# FastMCP takes no version argument, and the underlying server otherwise reports
-# the installed mcp SDK's version in the initialize response instead of ours.
-mcp._mcp_server.version = __version__
+if not _MCP_V2:
+    # FastMCP takes no version argument, and the underlying server otherwise reports
+    # the installed mcp SDK's version in the initialize response instead of ours.
+    mcp._mcp_server.version = __version__
 
 
 # --------------------------------------------------------------------------- #
